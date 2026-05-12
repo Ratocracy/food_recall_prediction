@@ -1,0 +1,223 @@
+library(jsonlite)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(readr)
+library(tidyr)
+library(janitor)
+
+# ---- Load FDA food recalls ----
+recall_raw <- fromJSON("food-enforcement-0001-of-0001.json", flatten = TRUE)
+
+fda <- recall_raw$results %>%
+  as_tibble() %>%
+  filter(country == "United States", product_type == "Food") %>%
+  mutate(
+    recall_date = ymd(recall_initiation_date),
+    year  = year(recall_date),
+    month = month(recall_date),
+    date  = floor_date(recall_date, "month"),
+    state_abbr = toupper(trimws(state)),
+    classification = str_squish(classification),
+    reason_lc = str_to_lower(reason_for_recall)
+  ) %>%
+  filter(!is.na(recall_date), !is.na(state_abbr), nchar(state_abbr) == 2)
+
+# ---- Extract pathogen -> create JOIN KEY that matches cost taxonomy ----
+fda <- fda %>%
+  mutate(
+    pathogen_cost_key = case_when(
+      str_detect(reason_lc, regex("listeria\\s+m(ono)?c(ytogenes)?|listeria\\s*m\\.", ignore_case = TRUE)) ~
+        "Listeria monocytogenes (total)",
+      
+      str_detect(reason_lc, regex("salmonella(\\s+spp\\.?|\\s+species|\\s+enteritidis|\\s+typhimurium)?", ignore_case = TRUE)) ~
+        "Salmonella spp., nontyphoidal",
+      
+      str_detect(reason_lc, regex("campylobacter(\\s+(jejuni|coli))?", ignore_case = TRUE)) ~
+        "Campylobacter spp.",
+      
+      # STEC: specific first
+      str_detect(reason_lc, regex("e\\.?\\s*coli\\s*o157|stec\\s*o157", ignore_case = TRUE)) ~
+        "STEC O157",
+      str_detect(reason_lc, regex("non\\s*-?o157", ignore_case = TRUE)) ~
+        "STEC non-O157",
+      str_detect(reason_lc, regex("\\bstec\\b|shiga\\s*-?toxin", ignore_case = TRUE)) ~
+        "STEC (unspecified)",
+      
+      str_detect(reason_lc, regex("norovirus|norwalk", ignore_case = TRUE)) ~
+        "Norovirus",
+      
+      # Hep A: match cost label exactly
+      str_detect(reason_lc, regex("hepatitis\\s*a|\\bhav\\b", ignore_case = TRUE)) ~
+        "Hepatitis A virus",
+      
+      str_detect(reason_lc, regex("cyclospora|cayetanensis", ignore_case = TRUE)) ~
+        "Cyclospora cayetanensis",
+      
+      # Vibrio: species-specific first, else "other"
+      str_detect(reason_lc, regex("vibrio\\s+vulnificus|v\\.\\s*vulnificus", ignore_case = TRUE)) ~
+        "Vibrio vulnificus",
+      str_detect(reason_lc, regex("vibrio\\s+parahaemolyticus|v\\.\\s*parahaemolyticus", ignore_case = TRUE)) ~
+        "Vibrio parahaemolyticus",
+      str_detect(reason_lc, regex("vibrio\\s+cholerae|v\\.\\s*cholerae", ignore_case = TRUE)) ~
+        "Vibrio cholerae, toxigenic",
+      str_detect(reason_lc, regex("\\bvibrio\\b|\\bv\\.", ignore_case = TRUE)) ~
+        "Vibrio spp., other",
+      
+      str_detect(reason_lc, regex("yersinia|y\\.\\s*enterocolitica", ignore_case = TRUE)) ~
+        "Yersinia enterocolitica",
+      
+      # Protozoa split to match cost labels
+      str_detect(reason_lc, regex("cryptosporidium|\\bcrypto\\b", ignore_case = TRUE)) ~
+        "Cryptosporidium spp.",
+      str_detect(reason_lc, regex("giardia", ignore_case = TRUE)) ~
+        "Giardia intestinalis",
+      
+      str_detect(reason_lc, regex("clostridium\\s+botulinum|c\\.\\s*botulinum", ignore_case = TRUE)) ~
+        "Clostridium botulinum",
+      
+      str_detect(reason_lc, regex("clostridium\\s+perfringens|c\\.\\s*perfringens", ignore_case = TRUE)) ~
+        "Clostridium perfringens",
+      
+      str_detect(reason_lc, regex("staphylococcus\\s*aureus|s\\.\\s*aureus", ignore_case = TRUE)) ~
+        "Staphylococcus aureus",
+      
+      str_detect(reason_lc, regex("shigella(\\s+\\w+)?", ignore_case = TRUE)) ~
+        "Shigella spp.",
+      
+      str_detect(reason_lc, regex("bacillus\\s+cereus|b\\.\\s*cereus", ignore_case = TRUE)) ~
+        "Bacillus cereus",
+      
+      str_detect(reason_lc, regex("brucella(\\s+spp\\.?|\\s+species)?", ignore_case = TRUE)) ~
+        "Brucella spp.",
+      
+      str_detect(reason_lc, regex("mycobacterium\\s+bovis|m\\.\\s*bovis", ignore_case = TRUE)) ~
+        "Mycobacterium bovis",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+# ---- Outcomes: recalls per state-month (+ severity) ----
+fda_state_month <- fda %>%
+  group_by(state_abbr, year, month, date) %>%
+  summarise(
+    recall_count = n(),
+    class_I   = sum(classification == "Class I",   na.rm = TRUE),
+    class_II  = sum(classification == "Class II",  na.rm = TRUE),
+    class_III = sum(classification == "Class III", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(fda_state_month, "fda_food_recalls_state_month.csv")
+
+# ---- Join to NOAA features (keep zero-recall months) ----
+ml_panel <- climate_features %>%
+  transmute(
+    state_abbr, year, month, date,
+    temp_f, pcpn_in, temp_anom, pcpn_anom,
+    temp_f_lag1, pcpn_in_lag1, temp_f_roll3, pcpn_in_roll3,
+    month_sin, month_cos
+  ) %>%
+  left_join(fda_state_month, by = c("state_abbr","year","month","date")) %>%
+  mutate(
+    recall_count = replace_na(recall_count, 0L),
+    class_I      = replace_na(class_I, 0L),
+    class_II     = replace_na(class_II, 0L),
+    class_III    = replace_na(class_III, 0L)
+  )
+
+write_csv(ml_panel, "ml_panel_noaa_x_fda_recalls.csv")
+
+# ---- Load pathogen cost table (standardize columns) ----
+cost <- read_csv("foodborne-illness-cost-2023.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  transmute(
+    pathogen_cost_key = str_squish(pathogen),
+    annual_cases      = mean_number_of_cases,
+    mean_total_cost_m = mean_total_cost_millions,
+    mean_per_case_cost = mean_per_case_cost
+  ) %>%
+  filter(!pathogen_cost_key %in% c("Subtotal", "Total", "Other foodborne gastroenteritis"))
+
+# ---- Add missing taxonomy rows to cost so joins do NOT drop data (FIXED weighted.mean ordering) ----
+stec_unspecified_cost <- cost %>%
+  filter(pathogen_cost_key %in% c("STEC O157", "STEC non-O157")) %>%
+  summarise(
+    pathogen_cost_key  = "STEC (unspecified)",
+    mean_total_cost_m  = NA_real_,
+    mean_per_case_cost = weighted.mean(mean_per_case_cost, w = annual_cases, na.rm = TRUE),
+    annual_cases       = sum(annual_cases, na.rm = TRUE)
+  )
+
+vibrio_bucket_cost <- cost %>%
+  filter(str_detect(pathogen_cost_key, "^Vibrio")) %>%
+  summarise(
+    pathogen_cost_key  = "Vibrio spp.",
+    mean_total_cost_m  = NA_real_,
+    mean_per_case_cost = weighted.mean(mean_per_case_cost, w = annual_cases, na.rm = TRUE),
+    annual_cases       = sum(annual_cases, na.rm = TRUE)
+  )
+
+cost_keyed <- bind_rows(cost, stec_unspecified_cost, vibrio_bucket_cost) %>%
+  group_by(pathogen_cost_key) %>%
+  summarise(
+    mean_per_case_cost = weighted.mean(mean_per_case_cost, w = annual_cases, na.rm = TRUE),
+    annual_cases       = sum(annual_cases, na.rm = TRUE),
+    mean_total_cost_m  = suppressWarnings(max(mean_total_cost_m, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ---- AUDIT: ensure all extracted pathogens have costs ----
+missing_cost_keys <- fda %>%
+  filter(!is.na(pathogen_cost_key)) %>%
+  distinct(pathogen_cost_key) %>%
+  left_join(cost_keyed %>% select(pathogen_cost_key, mean_per_case_cost),
+            by = "pathogen_cost_key") %>%
+  filter(is.na(mean_per_case_cost))
+
+print(missing_cost_keys)  # Expect 0 rows
+
+# ---- Count recalls by state-month-pathogen -> join cost -> roll up cost index ----
+fda_state_month_cost <- fda %>%
+  filter(!is.na(pathogen_cost_key)) %>%
+  group_by(state_abbr, year, month, date, pathogen_cost_key) %>%
+  summarise(recall_count_pathogen = n(), .groups = "drop") %>%
+  left_join(cost_keyed, by = "pathogen_cost_key") %>%
+  mutate(pathogen_weighted_cost_index = recall_count_pathogen * mean_per_case_cost) %>%
+  group_by(state_abbr, year, month, date) %>%
+  summarise(
+    pathogen_recalls = sum(recall_count_pathogen, na.rm = TRUE),
+    pathogen_weighted_cost_index = sum(pathogen_weighted_cost_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Join cost features into modeling panel ----
+ml_panel_cost <- ml_panel %>%
+  left_join(fda_state_month_cost, by = c("state_abbr","year","month","date")) %>%
+  mutate(
+    pathogen_recalls = replace_na(pathogen_recalls, 0L),
+    pathogen_weighted_cost_index = replace_na(pathogen_weighted_cost_index, 0)
+  ) %>%
+  filter(date >= as.Date("2008-02-01")) %>%
+  mutate(
+    log_pathogen_cost_index = log1p(pathogen_weighted_cost_index)
+  )
+
+# checks
+ml_panel_cost %>%
+  filter(pathogen_weighted_cost_index > 0) %>%
+  arrange(desc(pathogen_weighted_cost_index)) %>%
+  head(10) %>%
+  print(n = 10)
+
+ml_panel_cost %>%
+  summarise(
+    total_recalls = sum(recall_count),
+    total_pathogen_recalls = sum(pathogen_recalls),
+    share_pathogen = total_pathogen_recalls / total_recalls
+  ) %>%
+  print()
+
+write_csv(ml_panel_cost, "ml_panel_noaa_x_fda_recalls_x_cost.csv")
+

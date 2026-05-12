@@ -1,0 +1,28 @@
+{
+    "id": "F25D2A48",
+    "path": null,
+    "project_path": null,
+    "type": "object_explorer",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1771283920352.0,
+    "source_on_save": false,
+    "relative_order": 3,
+    "properties": {
+        "id": "a19143c3e4d947f1bc223f64897a3565",
+        "name": "recall_raw",
+        "title": "recall_raw",
+        "language": "R",
+        "source_window_id": "",
+        "Source": "Source"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1771281134,
+    "encoding": "",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1771283920352,
+    "read_only": false,
+    "read_only_alternatives": []
+}
